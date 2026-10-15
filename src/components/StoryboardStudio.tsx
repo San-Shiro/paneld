@@ -407,12 +407,91 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
   const handleChangeAspectRatio = (ratioId: AspectRatioId) => {
     if (!activeFrame) return;
     const preset = ASPECT_RATIOS[ratioId];
+    const contentWidth = activeFrame.contentWidth ?? activeFrame.width;
+    const contentHeight = activeFrame.contentHeight ?? activeFrame.height;
     handleUpdateFrameMeta(activeFrame.id, {
       aspectRatio: ratioId,
       width: preset.width,
       height: preset.height,
+      contentWidth,
+      contentHeight,
     });
   };
+
+  const handleToggleFitMode = (mode: "contain" | "fill") => {
+    if (!activeFrame) return;
+    handleUpdateFrameMeta(activeFrame.id, { fitMode: mode });
+  };
+
+  const handleSerialiseShots = useCallback((mode: "alpha" | "numeric" = "alpha") => {
+    setFrames((prev) => {
+      const sorted = [...prev].sort(
+        (a, b) => (a.sequenceOrder ?? 0) - (b.sequenceOrder ?? 0)
+      );
+      return sorted.map((f, i) => ({
+        ...f,
+        shotNumber:
+          mode === "alpha" ? `${i + 1}A` : String(i + 1).padStart(2, "0"),
+        sequenceOrder: (i + 1) * 1000,
+        updatedAt: Date.now(),
+      }));
+    });
+  }, []);
+
+  const handleMoveShotSequence = useCallback(
+    (frameId: string, direction: "up" | "down") => {
+      setFrames((prev) => {
+        const idx = prev.findIndex((f) => f.id === frameId);
+        if (idx === -1) return prev;
+        const targetIdx = direction === "up" ? idx - 1 : idx + 1;
+        if (targetIdx < 0 || targetIdx >= prev.length) return prev;
+
+        const copy = [...prev];
+        const temp = copy[idx]!;
+        copy[idx] = copy[targetIdx]!;
+        copy[targetIdx] = temp;
+
+        return copy.map((f, i) => ({
+          ...f,
+          sequenceOrder: (i + 1) * 1000,
+          updatedAt: Date.now(),
+        }));
+      });
+    },
+    []
+  );
+
+  const handleAddFrameAt = useCallback(
+    (worldX: number, worldY: number, aspectId: AspectRatioId = "16:9") => {
+      const preset = ASPECT_RATIOS[aspectId] ?? ASPECT_RATIOS["16:9"];
+      const newIndex = frames.length + 1;
+      const newId = `frame_${Date.now().toString(36)}`;
+      const newFrame: StoryboardFrameData = {
+        id: newId,
+        shotNumber: `${newIndex}A`,
+        title: `SHOT ${newIndex}`,
+        caption: "",
+        aspectRatio: preset.id,
+        width: preset.width,
+        height: preset.height,
+        contentWidth: preset.width,
+        contentHeight: preset.height,
+        fitMode: "contain",
+        paperTheme: activeFrame?.paperTheme ?? "warm-cream",
+        pattern: activeFrame?.pattern ?? "blank",
+        guides: ["thirds"],
+        hideRoughLayer: false,
+        x: worldX,
+        y: worldY,
+        sequenceOrder: newIndex * 1000,
+        strokes: [],
+        updatedAt: Date.now(),
+      };
+      setFrames((prev) => [...prev, newFrame]);
+      setActiveFrameId(newId);
+    },
+    [frames.length, activeFrame?.paperTheme, activeFrame?.pattern]
+  );
 
   const handleToggleGuide = (guideId: CompositionGuideId) => {
     if (!activeFrame) return;
@@ -773,8 +852,172 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
         </div>
       </div>
 
-      {/* Main Workspace: Infinite Board + Right Frame Inspector */}
+      {/* Main Workspace: Left Filmstrip + Infinite Board + Right Frame Inspector */}
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        {/* Left Sequence Filmstrip Panel */}
+        <div
+          style={{
+            width: 220,
+            backgroundColor: "#121216",
+            borderRight: "1px solid rgba(255,255,255,0.08)",
+            display: "flex",
+            flexDirection: "column",
+            fontSize: 12,
+            overflow: "hidden",
+          }}
+        >
+          {/* Header with Serialise Button */}
+          <div
+            style={{
+              padding: "10px 12px",
+              borderBottom: "1px solid rgba(255,255,255,0.08)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+            }}
+          >
+            <span
+              style={{
+                fontWeight: 700,
+                color: "#fff",
+                fontSize: 11,
+                letterSpacing: "0.03em",
+              }}
+            >
+              SHOTS ({frames.length})
+            </span>
+            <button
+              type="button"
+              onClick={() => handleSerialiseShots("alpha")}
+              style={{
+                padding: "2px 7px",
+                borderRadius: 4,
+                background: "rgba(99,102,241,0.2)",
+                border: "1px solid #6366f1",
+                color: "#818cf8",
+                fontSize: 10,
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title="Re-number all shots sequentially (1A, 2A, 3A...)"
+            >
+              Serialise
+            </button>
+          </div>
+
+          {/* Scrollable list of shots */}
+          <div
+            style={{
+              flex: 1,
+              overflowY: "auto",
+              padding: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            {frames.map((f, i) => {
+              const active = f.id === activeFrameId;
+              return (
+                <div
+                  key={f.id}
+                  onClick={() => setActiveFrameId(f.id)}
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: 6,
+                    background: active ? "#1e1b4b" : "rgba(255,255,255,0.03)",
+                    border: active
+                      ? "1px solid #6366f1"
+                      : "1px solid rgba(255,255,255,0.06)",
+                    cursor: "pointer",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 3,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontWeight: 700,
+                        color: active ? "#818cf8" : "#fff",
+                        fontSize: 11,
+                      }}
+                    >
+                      {f.shotNumber}
+                    </span>
+                    <div style={{ display: "flex", gap: 3 }}>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleMoveShotSequence(f.id, "up");
+                        }}
+                        disabled={i === 0}
+                        style={{
+                          background: "transparent",
+                          border: "none",
+                          color: i === 0 ? "#52525b" : "#a1a1aa",
+                          cursor: i === 0 ? "default" : "pointer",
+                          padding: "0 2px",
+                          fontSize: 10,
+                        }}
+                        title="Move Up in Narrative Sequence"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleMoveShotSequence(f.id, "down");
+                        }}
+                        disabled={i === frames.length - 1}
+                        style={{
+                          background: "transparent",
+                          border: "none",
+                          color:
+                            i === frames.length - 1 ? "#52525b" : "#a1a1aa",
+                          cursor:
+                            i === frames.length - 1 ? "default" : "pointer",
+                          padding: "0 2px",
+                          fontSize: 10,
+                        }}
+                        title="Move Down in Narrative Sequence"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "#d4d4d8",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {f.title}
+                  </div>
+                  {f.nextFrameId && (
+                    <div style={{ fontSize: 9, color: "#34d399" }}>
+                      ➔ Linked to{" "}
+                      {frames.find((x) => x.id === f.nextFrameId)?.shotNumber ??
+                        "Shot"}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
         <div style={{ flex: 1, position: "relative" }}>
           <InfiniteBoard
             frames={frames}
@@ -795,6 +1038,7 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
             onEraseStroke={handleEraseStroke}
             onDuplicateFrame={handleDuplicateFrame}
             onDeleteFrame={handleDeleteFrame}
+            onAddFrameAt={handleAddFrameAt}
             onInFlightMove={handleInFlightMove}
           />
         </div>
@@ -861,6 +1105,65 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
                     </button>
                   );
                 })}
+              </div>
+
+              {/* Non-destructive Canvas Framing: Fit vs Fill */}
+              <div
+                style={{
+                  marginTop: 10,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  backgroundColor: "rgba(255,255,255,0.03)",
+                  padding: "6px 10px",
+                  borderRadius: 7,
+                }}
+              >
+                <span style={{ color: "#a1a1aa", fontSize: 11 }}>Canvas Framing:</span>
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleFitMode("contain")}
+                    style={{
+                      padding: "3px 8px",
+                      borderRadius: 4,
+                      fontSize: 10,
+                      fontWeight: 600,
+                      background:
+                        activeFrame.fitMode !== "fill" ? "#312e81" : "#1c1c22",
+                      border:
+                        activeFrame.fitMode !== "fill"
+                          ? "1px solid #6366f1"
+                          : "1px solid rgba(255,255,255,0.08)",
+                      color: activeFrame.fitMode !== "fill" ? "#fff" : "#a1a1aa",
+                      cursor: "pointer",
+                    }}
+                    title="Scale & fit entire artwork inside canvas without any clipping"
+                  >
+                    Fit (Contain)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleFitMode("fill")}
+                    style={{
+                      padding: "3px 8px",
+                      borderRadius: 4,
+                      fontSize: 10,
+                      fontWeight: 600,
+                      background:
+                        activeFrame.fitMode === "fill" ? "#312e81" : "#1c1c22",
+                      border:
+                        activeFrame.fitMode === "fill"
+                          ? "1px solid #6366f1"
+                          : "1px solid rgba(255,255,255,0.08)",
+                      color: activeFrame.fitMode === "fill" ? "#fff" : "#a1a1aa",
+                      cursor: "pointer",
+                    }}
+                    title="Fill canvas without letterboxing"
+                  >
+                    Fill (Crop)
+                  </button>
+                </div>
               </div>
             </div>
           )}

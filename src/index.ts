@@ -14,6 +14,7 @@ export type {
   SpatialNote,
   StoryboardFrameData,
   StoryboardToolId,
+  StoryLink,
   StrokeLayer,
 } from "./core/types";
 

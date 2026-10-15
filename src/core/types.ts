@@ -67,6 +67,13 @@ export interface CompactStroke {
   seed?: number;
 }
 
+export interface StoryLink {
+  id: string;
+  fromFrameId: string;
+  toFrameId: string;
+  label?: string;
+}
+
 export interface StoryboardFrameData {
   id: string;
   shotNumber: string;
@@ -77,6 +84,10 @@ export interface StoryboardFrameData {
   aspectRatio: AspectRatioId;
   width: number;
   height: number;
+  /** Canonical artwork content coordinates to prevent cropping on aspect changes */
+  contentWidth?: number;
+  contentHeight?: number;
+  fitMode?: "contain" | "fill";
   paperTheme: PaperThemeId;
   pattern: BackgroundPatternId;
   guides: CompositionGuideId[];
@@ -84,6 +95,10 @@ export interface StoryboardFrameData {
   /** Position on the Tier-2 Infinite Spatial Board */
   x: number;
   y: number;
+  /** Narrative sequence sort order (e.g. 1000, 2000, 3000) */
+  sequenceOrder?: number;
+  /** Explicit manual join link to next shot in sequence */
+  nextFrameId?: string;
   strokes: CompactStroke[];
   updatedAt: number;
 }
@@ -104,6 +119,7 @@ export interface BoardSnapshot {
   byteSize: number;
   frames: StoryboardFrameData[];
   notes: SpatialNote[];
+  links?: StoryLink[];
 }
 
 export interface BoardDocument {
@@ -112,6 +128,7 @@ export interface BoardDocument {
   frames: StoryboardFrameData[];
   notes: SpatialNote[];
   snapshots: BoardSnapshot[];
+  links?: StoryLink[];
 }
 
 export interface CollaboratorPresence {

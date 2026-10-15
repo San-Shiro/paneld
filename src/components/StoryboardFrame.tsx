@@ -31,6 +31,8 @@ export interface StoryboardFrameProps {
   onionSkinStrokes?: CompactStroke[];
   remoteCollaborators?: CollaboratorPresence[];
   debugMode?: boolean;
+  intraZoom?: number;
+  intraPan?: { x: number; y: number };
   onCommitStroke?: (frameId: string, stroke: CompactStroke) => void;
   onEraseStroke?: (frameId: string, strokeId: string) => void;
   onInFlightMove?: (
@@ -74,6 +76,8 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
   onionSkinStrokes,
   remoteCollaborators = [],
   debugMode = false,
+  intraZoom = 1,
+  intraPan,
   onCommitStroke,
   onEraseStroke,
   onInFlightMove,
@@ -81,6 +85,35 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
   className = "",
 }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // Canonical artwork dimensions (preserves strokes without clipping when aspect ratio changes)
+  const contentW = frame.contentWidth ?? frame.width;
+  const contentH = frame.contentHeight ?? frame.height;
+  const fitMode = frame.fitMode ?? "contain";
+
+  // Calculate non-destructive aperture containment transform
+  const apertureTransform = useMemo(() => {
+    let scale = 1;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (frame.width !== contentW || frame.height !== contentH) {
+      scale =
+        fitMode === "contain"
+          ? Math.min(frame.width / contentW, frame.height / contentH)
+          : Math.max(frame.width / contentW, frame.height / contentH);
+
+      offsetX = (frame.width - contentW * scale) / 2;
+      offsetY = (frame.height - contentH * scale) / 2;
+    }
+
+    const zoomFactor = intraZoom && intraZoom > 0 ? intraZoom : 1;
+    const finalScale = scale * zoomFactor;
+    const finalOffsetX = offsetX + (intraPan?.x || 0);
+    const finalOffsetY = offsetY + (intraPan?.y || 0);
+
+    return { scale: finalScale, offsetX: finalOffsetX, offsetY: finalOffsetY };
+  }, [frame.width, frame.height, contentW, contentH, fitMode, intraZoom, intraPan]);
 
   // Robust pointer tracking refs
   const activePointerIdRef = useRef<number | null>(null);
@@ -118,36 +151,44 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
   }, [frame.strokes]);
 
   /**
-   * Convert screen (clientX, clientY) to SVG frame coordinates using CTM
-   * (Screen Current Transformation Matrix). This immune-shields coordinates against
-   * infinite canvas pan/zoom transforms and CSS scaling on both mobile and desktop.
+   * Convert screen (clientX, clientY) to SVG frame coordinates using CTM,
+   * then invert through the aperture containment transform so all strokes
+   * land in the canonical content coordinate space without cropping or distortion.
    */
   const toFrameCoords = useCallback(
     (clientX: number, clientY: number): Point2D => {
       const svg = svgRef.current;
       if (!svg) return { x: 0, y: 0 };
 
+      let apX = 0;
+      let apY = 0;
+
       try {
         const ctm = svg.getScreenCTM();
         if (ctm) {
           const pt = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
           if (Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
-            return { x: pt.x, y: pt.y };
+            apX = pt.x;
+            apY = pt.y;
           }
         }
       } catch {
         // Fallback to bounding rect if CTM inversion encounters singular matrix
+        const rect = svg.getBoundingClientRect();
+        const scaleX = frame.width / (rect.width || 1);
+        const scaleY = frame.height / (rect.height || 1);
+        apX = (clientX - rect.left) * scaleX;
+        apY = (clientY - rect.top) * scaleY;
       }
 
-      const rect = svg.getBoundingClientRect();
-      const scaleX = frame.width / (rect.width || 1);
-      const scaleY = frame.height / (rect.height || 1);
+      // Invert aperture transform to land precisely into canonical content space
+      const { scale, offsetX, offsetY } = apertureTransform;
       return {
-        x: (clientX - rect.left) * scaleX,
-        y: (clientY - rect.top) * scaleY,
+        x: (apX - offsetX) / (scale || 1),
+        y: (apY - offsetY) / (scale || 1),
       };
     },
-    [frame.width, frame.height]
+    [frame.width, frame.height, apertureTransform]
   );
 
   const checkInBounds = useCallback(
@@ -558,94 +599,108 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
         guides={frame.guides}
       />
 
-      {/* Optional Onion Skin (Previous Panel Ghosting at 14% opacity) */}
-      {onionSkinStrokes && onionSkinStrokes.length > 0 && (
-        <g opacity={0.14} className="pointer-events-none">
-          {onionSkinStrokes.map((s) => (
-            <StrokePath key={`onion_${s.id}`} stroke={s} />
-          ))}
-        </g>
-      )}
+      {/* Aperture Clip Boundary to prevent edge bleeding on canvas resize */}
+      <defs>
+        <clipPath id={`aperture_clip_${frame.id}`}>
+          <rect width={frame.width} height={frame.height} />
+        </clipPath>
+      </defs>
 
-      {/* Layer 1: Rough Under-Sketch Pencil (Can be hidden with 1 click) */}
-      {!frame.hideRoughLayer && (
-        <g data-layer="pencil">
-          {layeredStrokes.pencil.map((s) => (
-            <StrokePath key={s.id} stroke={s} />
-          ))}
-          {inFlightStroke?.layer === "pencil" && <StrokePath stroke={inFlightStroke} />}
-        </g>
-      )}
+      {/* Non-destructive scaled artwork viewport */}
+      <g clipPath={`url(#aperture_clip_${frame.id})`}>
+        <g
+          transform={`translate(${apertureTransform.offsetX}, ${apertureTransform.offsetY}) scale(${apertureTransform.scale})`}
+        >
+          {/* Optional Onion Skin (Previous Panel Ghosting at 14% opacity) */}
+          {onionSkinStrokes && onionSkinStrokes.length > 0 && (
+            <g opacity={0.14} className="pointer-events-none">
+              {onionSkinStrokes.map((s) => (
+                <StrokePath key={`onion_${s.id}`} stroke={s} />
+              ))}
+            </g>
+          )}
 
-      {/* Layer 2: Shading / Tone Marker (ALWAYS renders behind Ink!) */}
-      <g data-layer="tone">
-        {layeredStrokes.tone.map((s) => (
-          <StrokePath key={s.id} stroke={s} />
-        ))}
-        {inFlightStroke?.layer === "tone" && <StrokePath stroke={inFlightStroke} />}
-      </g>
+          {/* Layer 1: Rough Under-Sketch Pencil (Can be hidden with 1 click) */}
+          {!frame.hideRoughLayer && (
+            <g data-layer="pencil">
+              {layeredStrokes.pencil.map((s) => (
+                <StrokePath key={s.id} stroke={s} />
+              ))}
+              {inFlightStroke?.layer === "pencil" && <StrokePath stroke={inFlightStroke} />}
+            </g>
+          )}
 
-      {/* Layer 3: Crisp Ink Outlines */}
-      <g data-layer="ink">
-        {layeredStrokes.ink.map((s) => (
-          <StrokePath key={s.id} stroke={s} />
-        ))}
-        {inFlightStroke?.layer === "ink" && <StrokePath stroke={inFlightStroke} />}
-      </g>
-
-      {/* Layer 4: Director Notes, Camera Frames & Action Arrows */}
-      <g data-layer="notes">
-        {layeredStrokes.notes.map((s) => (
-          <StrokePath key={s.id} stroke={s} />
-        ))}
-        {inFlightStroke?.layer === "notes" && <StrokePath stroke={inFlightStroke} />}
-      </g>
-
-      {/* Live Remote Collaborator In-Flight Strokes & Cursors */}
-      {remoteCollaborators
-        .filter((c) => c.activeFrameId === frame.id)
-        .map((peer) => (
-          <g key={peer.clientId} className="pointer-events-none">
-            {peer.inFlightStroke && <StrokePath stroke={peer.inFlightStroke} />}
-            {peer.frameX !== undefined && peer.frameY !== undefined && (
-              <g transform={`translate(${peer.frameX}, ${peer.frameY})`}>
-                <circle r={5} fill={peer.color} stroke="#ffffff" strokeWidth={1.5} />
-                <rect
-                  x={8}
-                  y={-10}
-                  width={peer.name.length * 6.5 + 10}
-                  height={18}
-                  rx={4}
-                  fill={peer.color}
-                />
-                <text
-                  x={13}
-                  y={2}
-                  fill="#ffffff"
-                  fontSize={10}
-                  fontWeight={600}
-                  fontFamily="system-ui, sans-serif"
-                >
-                  {peer.name}
-                </text>
-              </g>
-            )}
+          {/* Layer 2: Shading / Tone Marker (ALWAYS renders behind Ink!) */}
+          <g data-layer="tone">
+            {layeredStrokes.tone.map((s) => (
+              <StrokePath key={s.id} stroke={s} />
+            ))}
+            {inFlightStroke?.layer === "tone" && <StrokePath stroke={inFlightStroke} />}
           </g>
-        ))}
 
-      {/* Active Brush Ring Preview */}
-      {interactive && cursorPos && (
-        <circle
-          cx={cursorPos.x}
-          cy={cursorPos.y}
-          r={Math.max(2, effectiveSize / 2)}
-          fill="none"
-          stroke={activeTool === "eraser" ? "#ef4444" : effectiveColor}
-          strokeWidth={1.2}
-          opacity={0.65}
-          className="pointer-events-none"
-        />
-      )}
+          {/* Layer 3: Crisp Ink Outlines */}
+          <g data-layer="ink">
+            {layeredStrokes.ink.map((s) => (
+              <StrokePath key={s.id} stroke={s} />
+            ))}
+            {inFlightStroke?.layer === "ink" && <StrokePath stroke={inFlightStroke} />}
+          </g>
+
+          {/* Layer 4: Director Notes, Camera Frames & Action Arrows */}
+          <g data-layer="notes">
+            {layeredStrokes.notes.map((s) => (
+              <StrokePath key={s.id} stroke={s} />
+            ))}
+            {inFlightStroke?.layer === "notes" && <StrokePath stroke={inFlightStroke} />}
+          </g>
+
+          {/* Live Remote Collaborator In-Flight Strokes & Cursors */}
+          {remoteCollaborators
+            .filter((c) => c.activeFrameId === frame.id)
+            .map((peer) => (
+              <g key={peer.clientId} className="pointer-events-none">
+                {peer.inFlightStroke && <StrokePath stroke={peer.inFlightStroke} />}
+                {peer.frameX !== undefined && peer.frameY !== undefined && (
+                  <g transform={`translate(${peer.frameX}, ${peer.frameY})`}>
+                    <circle r={5} fill={peer.color} stroke="#ffffff" strokeWidth={1.5} />
+                    <rect
+                      x={8}
+                      y={-10}
+                      width={peer.name.length * 6.5 + 10}
+                      height={18}
+                      rx={4}
+                      fill={peer.color}
+                    />
+                    <text
+                      x={13}
+                      y={2}
+                      fill="#ffffff"
+                      fontSize={10}
+                      fontWeight={600}
+                      fontFamily="system-ui, sans-serif"
+                    >
+                      {peer.name}
+                    </text>
+                  </g>
+                )}
+              </g>
+            ))}
+
+          {/* Active Brush Ring Preview in Canonical Space */}
+          {interactive && cursorPos && (
+            <circle
+              cx={cursorPos.x}
+              cy={cursorPos.y}
+              r={Math.max(2, effectiveSize / 2)}
+              fill="none"
+              stroke={activeTool === "eraser" ? "#ef4444" : effectiveColor}
+              strokeWidth={1.2 / apertureTransform.scale}
+              opacity={0.65}
+              className="pointer-events-none"
+            />
+          )}
+        </g>
+      </g>
 
       {/* High-Visibility Debug Overlay */}
       {debugMode && (

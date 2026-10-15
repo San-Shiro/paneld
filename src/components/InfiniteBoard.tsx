@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AspectRatioId,
   CollaboratorPresence,
   CompactStroke,
   StoryboardFrameData,
   StoryboardToolId,
 } from "../core/types";
+import { ASPECT_RATIOS } from "../core/presets";
 import { StoryboardFrame } from "./StoryboardFrame";
 import {
   globalPointerRingBuffer,
@@ -32,6 +34,7 @@ export interface InfiniteBoardProps {
   onEraseStroke: (frameId: string, strokeId: string) => void;
   onDuplicateFrame: (frameId: string) => void;
   onDeleteFrame: (frameId: string) => void;
+  onAddFrameAt?: (worldX: number, worldY: number, aspect?: AspectRatioId) => void;
   onInFlightMove?: (
     frameId: string,
     x: number,
@@ -59,12 +62,28 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   onEraseStroke,
   onDuplicateFrame,
   onDeleteFrame,
+  onAddFrameAt,
   onInFlightMove,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [pan, setPan] = useState({ x: 80, y: 70 });
   const [zoom, setZoom] = useState(0.75);
   const [spacePressed, setSpacePressed] = useState(false);
+
+  // Intra-shot Zoom (Shot Edit Mode)
+  const [editingShotId, setEditingShotId] = useState<string | null>(null);
+  const [shotZoomMap, setShotZoomMap] = useState<Record<string, number>>({});
+
+  // Right-click Canvas Context Menu State
+  const [contextMenu, setContextMenu] = useState<{
+    clientX: number;
+    clientY: number;
+    worldX: number;
+    worldY: number;
+  } | null>(null);
+
+  // Manual Join / Link Target Picker State
+  const [linkingFromId, setLinkingFromId] = useState<string | null>(null);
 
   // Internal debug mode toggle fallback
   const [internalDebugMode, setInternalDebugMode] = useState(false);
@@ -107,7 +126,17 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     origY: number;
   } | null>(null);
 
-  // Track Spacebar for pan mode, or shortcut 'D' for debug HUD
+  // Dismiss context menu and link picker on global clicks
+  useEffect(() => {
+    const handleDismiss = () => {
+      setContextMenu(null);
+      setLinkingFromId(null);
+    };
+    window.addEventListener("click", handleDismiss);
+    return () => window.removeEventListener("click", handleDismiss);
+  }, []);
+
+  // Track Spacebar for pan mode, or shortcut 'D' for debug HUD, 'Escape' to exit Shot Edit Mode
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (
@@ -120,6 +149,10 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         setSpacePressed(true);
       } else if (e.key === "d" || e.key === "D") {
         handleToggleDebug();
+      } else if (e.key === "Escape") {
+        setContextMenu(null);
+        setLinkingFromId(null);
+        setEditingShotId(null);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -183,7 +216,39 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     [onSelectFrame]
   );
 
+  // Right-click on infinite background to add a shot frame at exact world position
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      const isBg =
+        target === containerRef.current ||
+        target.tagName.toLowerCase() === "rect" ||
+        target.hasAttribute("data-board-bg");
+
+      if (isBg) {
+        e.preventDefault();
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+
+        const worldX = Math.round((e.clientX - rect.left - pan.x) / zoom);
+        const worldY = Math.round((e.clientY - rect.top - pan.y) / zoom);
+
+        setContextMenu({
+          clientX: e.clientX,
+          clientY: e.clientY,
+          worldX: worldX - 400,
+          worldY: worldY - 225,
+        });
+      }
+    },
+    [pan, zoom]
+  );
+
   const handleBoardPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Dismiss context menus if clicking outside
+    if (contextMenu) setContextMenu(null);
+    if (linkingFromId) setLinkingFromId(null);
+
     // Middle click, Space+Click, or clicking directly on the infinite background
     if (e.button === 1 || spacePressed || e.target === e.currentTarget) {
       isPanningRef.current = true;
@@ -234,31 +299,69 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     draggingFrameRef.current = null;
   };
 
-  // Build sequential cinematic flow arrows connecting frames
-  const sequenceConnectors = React.useMemo(() => {
+  // Build sequential & manual cinematic flow connectors connecting frames
+  const sequenceConnectors = useMemo(() => {
     if (!showSequenceArrows || frames.length < 2) return [];
 
-    const connectors: { id: string; d: string; label: string }[] = [];
+    const frameMap = new Map(frames.map((f) => [f.id, f]));
+    const connectors: {
+      id: string;
+      d: string;
+      label: string;
+      fromId: string;
+      toId: string;
+      isManual: boolean;
+    }[] = [];
+
+    const explicitLinked = new Set<string>();
+
+    // 1. Process explicit manual join links
+    for (const from of frames) {
+      if (from.nextFrameId && frameMap.has(from.nextFrameId)) {
+        const to = frameMap.get(from.nextFrameId)!;
+        explicitLinked.add(from.id);
+
+        const startX = from.x + from.width;
+        const startY = from.y + from.height / 2;
+        const endX = to.x;
+        const endY = to.y + to.height / 2;
+        const dx = endX - startX;
+        const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
+
+        connectors.push({
+          id: `conn_manual_${from.id}_${to.id}`,
+          fromId: from.id,
+          toId: to.id,
+          isManual: true,
+          d: `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`,
+          label: `${from.shotNumber} ➔ ${to.shotNumber}`,
+        });
+      }
+    }
+
+    // 2. Default sequential links for frames without explicit links
     for (let i = 0; i < frames.length - 1; i++) {
       const from = frames[i]!;
       const to = frames[i + 1]!;
+      if (!explicitLinked.has(from.id)) {
+        const startX = from.x + from.width;
+        const startY = from.y + from.height / 2;
+        const endX = to.x;
+        const endY = to.y + to.height / 2;
+        const dx = endX - startX;
+        const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
 
-      // Connect right edge of from-frame to left edge of to-frame
-      const startX = from.x + from.width;
-      const startY = from.y + from.height / 2;
-      const endX = to.x;
-      const endY = to.y + to.height / 2;
-
-      const dx = endX - startX;
-      const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
-
-      const d = `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`;
-      connectors.push({
-        id: `conn_${from.id}_${to.id}`,
-        d,
-        label: `${from.shotNumber} ➔ ${to.shotNumber}`,
-      });
+        connectors.push({
+          id: `conn_seq_${from.id}_${to.id}`,
+          fromId: from.id,
+          toId: to.id,
+          isManual: false,
+          d: `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`,
+          label: `${from.shotNumber} ➔ ${to.shotNumber}`,
+        });
+      }
     }
+
     return connectors;
   }, [frames, showSequenceArrows]);
 
@@ -266,6 +369,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     <div
       ref={containerRef}
       onWheel={handleWheel}
+      onContextMenu={handleContextMenu}
       onPointerDown={handleBoardPointerDown}
       onPointerMove={handleBoardPointerMove}
       onPointerUp={handleBoardPointerUp}
@@ -284,6 +388,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     >
       {/* Background Dot Matrix Grid */}
       <svg
+        data-board-bg="true"
         style={{
           position: "absolute",
           inset: 0,
@@ -304,7 +409,12 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
             <circle cx={2} cy={2} r={1.2} fill="#ffffff" />
           </pattern>
         </defs>
-        <rect width="100%" height="100%" fill="url(#infinite_board_grid)" />
+        <rect
+          data-board-bg="true"
+          width="100%"
+          height="100%"
+          fill="url(#infinite_board_grid)"
+        />
       </svg>
 
       {/* World Space Container (Pan & Zoomed) */}
@@ -340,17 +450,32 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
               >
                 <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#6366f1" />
               </marker>
+              <marker
+                id="sequence_arrow_manual"
+                viewBox="0 0 10 10"
+                refX="7"
+                refY="5"
+                markerWidth="7"
+                markerHeight="7"
+                orient="auto-start-reverse"
+              >
+                <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#10b981" />
+              </marker>
             </defs>
             {sequenceConnectors.map((c) => (
               <g key={c.id}>
                 <path
                   d={c.d}
                   fill="none"
-                  stroke="#6366f1"
-                  strokeWidth={2.5}
-                  strokeDasharray="6 4"
-                  markerEnd="url(#sequence_arrow)"
-                  opacity={0.65}
+                  stroke={c.isManual ? "#10b981" : "#6366f1"}
+                  strokeWidth={c.isManual ? 3 : 2}
+                  strokeDasharray={c.isManual ? "none" : "6 4"}
+                  markerEnd={
+                    c.isManual
+                      ? "url(#sequence_arrow_manual)"
+                      : "url(#sequence_arrow)"
+                  }
+                  opacity={c.isManual ? 0.9 : 0.65}
                 />
               </g>
             ))}
@@ -360,6 +485,8 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         {/* Frames Layer */}
         {frames.map((frame, index) => {
           const isActive = activeFrameId === frame.id;
+          const isShotEditMode = editingShotId === frame.id;
+          const intraZoom = shotZoomMap[frame.id] ?? 1;
           const prevFrame = index > 0 ? frames[index - 1] : undefined;
 
           return (
@@ -375,9 +502,11 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                 width: frame.width,
                 borderRadius: 12,
                 backgroundColor: "#18181c",
-                boxShadow: isActive
-                  ? "0 0 0 3px #6366f1, 0 25px 50px -12px rgba(0,0,0,0.75)"
-                  : "0 0 0 1px rgba(255,255,255,0.12), 0 15px 30px -10px rgba(0,0,0,0.6)",
+                boxShadow: isShotEditMode
+                  ? "0 0 0 3px #10b981, 0 30px 60px -10px rgba(0,0,0,0.85)"
+                  : isActive
+                    ? "0 0 0 3px #6366f1, 0 25px 50px -12px rgba(0,0,0,0.75)"
+                    : "0 0 0 1px rgba(255,255,255,0.12), 0 15px 30px -10px rgba(0,0,0,0.6)",
                 transition: "box-shadow 0.15s ease",
               }}
             >
@@ -395,13 +524,20 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                     origY: frame.y,
                   };
                 }}
-                onDoubleClick={() => focusFrame(frame)}
+                onDoubleClick={() => {
+                  // Double click header toggles Shot Edit Mode (Canvas-only zoom)
+                  setEditingShotId(isShotEditMode ? null : frame.id);
+                }}
                 style={{
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "space-between",
                   padding: "8px 12px",
-                  backgroundColor: isActive ? "#1e1b4b" : "#202026",
+                  backgroundColor: isShotEditMode
+                    ? "#064e3b"
+                    : isActive
+                      ? "#1e1b4b"
+                      : "#202026",
                   borderTopLeftRadius: 12,
                   borderTopRightRadius: 12,
                   borderBottom: "1px solid rgba(255,255,255,0.08)",
@@ -413,7 +549,11 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span
                     style={{
-                      backgroundColor: isActive ? "#6366f1" : "#3f3f46",
+                      backgroundColor: isShotEditMode
+                        ? "#10b981"
+                        : isActive
+                          ? "#6366f1"
+                          : "#3f3f46",
                       color: "#fff",
                       padding: "2px 7px",
                       borderRadius: 5,
@@ -437,7 +577,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                       fontWeight: 600,
                       fontSize: 13,
                       outline: "none",
-                      width: 190,
+                      width: 170,
                     }}
                   />
                   <span
@@ -453,26 +593,74 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                   </span>
                 </div>
 
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  {/* Shot Focus / Intra-Shot Zoom Toggle Button */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditingShotId(isShotEditMode ? null : frame.id);
+                    }}
+                    title="Toggle Canvas Zoom Mode for this shot (Double-click header)"
+                    style={{
+                      background: isShotEditMode
+                        ? "rgba(16, 185, 129, 0.3)"
+                        : "rgba(255,255,255,0.08)",
+                      border: isShotEditMode ? "1px solid #10b981" : "none",
+                      color: isShotEditMode ? "#6ee7b7" : "#e4e4e7",
+                      borderRadius: 5,
+                      padding: "3px 7px",
+                      fontSize: 11,
+                      cursor: "pointer",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {isShotEditMode ? "Exit Zoom" : "Canvas Zoom"}
+                  </button>
+
+                  {/* Manual Join / Sequence Linking Button */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setLinkingFromId(linkingFromId === frame.id ? null : frame.id);
+                    }}
+                    title="Join to another shot in sequence"
+                    style={{
+                      background: frame.nextFrameId
+                        ? "rgba(16, 185, 129, 0.2)"
+                        : "rgba(255,255,255,0.08)",
+                      border: frame.nextFrameId ? "1px solid #10b981" : "none",
+                      color: frame.nextFrameId ? "#34d399" : "#e4e4e7",
+                      borderRadius: 5,
+                      padding: "3px 7px",
+                      fontSize: 11,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {frame.nextFrameId ? `➔ Linked` : `➔ Join`}
+                  </button>
+
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       focusFrame(frame);
                     }}
-                    title="Zoom to fit shot"
+                    title="Center & fit shot on screen"
                     style={{
                       background: "rgba(255,255,255,0.08)",
                       border: "none",
                       color: "#e4e4e7",
                       borderRadius: 5,
-                      padding: "3px 8px",
+                      padding: "3px 7px",
                       fontSize: 11,
                       cursor: "pointer",
                     }}
                   >
                     Focus
                   </button>
+
                   <button
                     type="button"
                     onClick={(e) => {
@@ -485,13 +673,14 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                       border: "none",
                       color: "#e4e4e7",
                       borderRadius: 5,
-                      padding: "3px 8px",
+                      padding: "3px 7px",
                       fontSize: 11,
                       cursor: "pointer",
                     }}
                   >
-                    Duplicate
+                    Copy
                   </button>
+
                   {frames.length > 1 && (
                     <button
                       type="button"
@@ -505,7 +694,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                         border: "none",
                         color: "#fca5a5",
                         borderRadius: 5,
-                        padding: "3px 8px",
+                        padding: "3px 7px",
                         fontSize: 11,
                         cursor: "pointer",
                       }}
@@ -515,6 +704,54 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                   )}
                 </div>
               </div>
+
+              {/* Intra-Shot Zoom Toolbar Banner (Visible only in Canvas Zoom Mode) */}
+              {isShotEditMode && (
+                <div
+                  style={{
+                    backgroundColor: "rgba(6, 78, 59, 0.95)",
+                    borderBottom: "1px solid rgba(16, 185, 129, 0.3)",
+                    padding: "4px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    fontSize: 11,
+                    color: "#a7f3d0",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontWeight: 700 }}>🔍 Canvas Zoom:</span>
+                    {[1, 1.5, 2, 3].map((level) => (
+                      <button
+                        key={level}
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShotZoomMap((m) => ({ ...m, [frame.id]: level }));
+                        }}
+                        style={{
+                          background:
+                            intraZoom === level
+                              ? "#10b981"
+                              : "rgba(255, 255, 255, 0.1)",
+                          color: intraZoom === level ? "#064e3b" : "#fff",
+                          border: "none",
+                          borderRadius: 4,
+                          padding: "2px 6px",
+                          fontWeight: 600,
+                          cursor: "pointer",
+                          fontSize: 10,
+                        }}
+                      >
+                        {level * 100}%
+                      </button>
+                    ))}
+                  </div>
+                  <span style={{ color: "#6ee7b7", fontSize: 10 }}>
+                    Press Esc to exit
+                  </span>
+                </div>
+              )}
 
               {/* Tier 1 Storyboard Drawing Surface */}
               <div
@@ -538,6 +775,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                   }
                   remoteCollaborators={remoteCollaborators}
                   debugMode={isActive && isDebugActive}
+                  intraZoom={intraZoom}
                   onCommitStroke={onCommitStroke}
                   onEraseStroke={onEraseStroke}
                   onInFlightMove={onInFlightMove}
@@ -599,12 +837,108 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                   }}
                 />
               </div>
+
+              {/* Manual Join / Sequence Linking Target Picker Popover */}
+              {linkingFromId === frame.id && (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    position: "absolute",
+                    top: 42,
+                    right: 12,
+                    backgroundColor: "#18181c",
+                    border: "1px solid rgba(255,255,255,0.16)",
+                    borderRadius: 8,
+                    boxShadow: "0 10px 25px rgba(0,0,0,0.8)",
+                    padding: 8,
+                    zIndex: 50,
+                    width: 220,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: "#a1a1aa",
+                      marginBottom: 6,
+                    }}
+                  >
+                    Join {frame.shotNumber} to Next Shot:
+                  </div>
+                  <div
+                    style={{
+                      maxHeight: 160,
+                      overflowY: "auto",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                    }}
+                  >
+                    {frame.nextFrameId && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onUpdateFrameMeta(frame.id, { nextFrameId: undefined });
+                          setLinkingFromId(null);
+                        }}
+                        style={{
+                          textAlign: "left",
+                          padding: "4px 8px",
+                          borderRadius: 4,
+                          background: "rgba(239,68,68,0.15)",
+                          border: "none",
+                          color: "#fca5a5",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        ✕ Unlink (Remove Connection)
+                      </button>
+                    )}
+                    {frames
+                      .filter((f) => f.id !== frame.id)
+                      .map((target) => (
+                        <button
+                          key={target.id}
+                          type="button"
+                          onClick={() => {
+                            onUpdateFrameMeta(frame.id, { nextFrameId: target.id });
+                            setLinkingFromId(null);
+                          }}
+                          style={{
+                            textAlign: "left",
+                            padding: "5px 8px",
+                            borderRadius: 4,
+                            background:
+                              frame.nextFrameId === target.id
+                                ? "#312e81"
+                                : "rgba(255,255,255,0.05)",
+                            border:
+                              frame.nextFrameId === target.id
+                                ? "1px solid #6366f1"
+                                : "none",
+                            color: "#fff",
+                            fontSize: 11,
+                            cursor: "pointer",
+                            display: "flex",
+                            justifyContent: "space-between",
+                          }}
+                        >
+                          <span>
+                            Shot {target.shotNumber}: {target.title}
+                          </span>
+                          <span style={{ color: "#818cf8" }}>➔</span>
+                        </button>
+                      ))}
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}
       </div>
 
-      {/* Floating Infinite Canvas Navigation & Debug Controls */}
+      {/* Floating Canvas Navigation & Debug Controls */}
       <div
         style={{
           position: "absolute",
@@ -711,9 +1045,75 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         </button>
 
         <span style={{ color: "#71717a", marginLeft: 6, fontSize: 11 }}>
-          Hold [Space] + Drag • [D] Debug
+          Right-Click to Add Shot • Space+Drag • Double-Click Shot to Zoom
         </span>
       </div>
+
+      {/* Right-Click Canvas Context Menu */}
+      {contextMenu && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            left: contextMenu.clientX,
+            top: contextMenu.clientY,
+            backgroundColor: "rgba(24, 24, 28, 0.96)",
+            border: "1px solid rgba(255,255,255,0.16)",
+            borderRadius: 10,
+            padding: 8,
+            boxShadow: "0 20px 40px rgba(0,0,0,0.8)",
+            backdropFilter: "blur(12px)",
+            zIndex: 9999,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+            width: 190,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              color: "#a1a1aa",
+              padding: "2px 6px",
+              borderBottom: "1px solid rgba(255,255,255,0.08)",
+              marginBottom: 4,
+            }}
+          >
+            + Add Shot Here
+          </div>
+          {Object.values(ASPECT_RATIOS).map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => {
+                onAddFrameAt?.(
+                  contextMenu.worldX,
+                  contextMenu.worldY,
+                  preset.id
+                );
+                setContextMenu(null);
+              }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "6px 8px",
+                borderRadius: 6,
+                background: "rgba(255,255,255,0.05)",
+                border: "none",
+                color: "#f4f4f5",
+                fontSize: 11,
+                cursor: "pointer",
+                textAlign: "left",
+              }}
+            >
+              <span>{preset.label}</span>
+              <span style={{ color: "#71717a", fontSize: 10 }}>{preset.id}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Floating Real-Time Diagnostics HUD Panel */}
       <DrawingDebugHUD
