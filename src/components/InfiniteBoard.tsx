@@ -82,6 +82,16 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     worldY: number;
   } | null>(null);
 
+  // Interactive Live Wire Drag State (Miro / FigJam style block linking)
+  const [wireDrag, setWireDrag] = useState<{
+    fromFrameId: string;
+    fromX: number;
+    fromY: number;
+    currentWorldX: number;
+    currentWorldY: number;
+    targetFrameId: string | null;
+  } | null>(null);
+
   // Manual Join / Link Target Picker State
   const [linkingFromId, setLinkingFromId] = useState<string | null>(null);
 
@@ -118,6 +128,15 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   const isPanningRef = useRef(false);
   const panStartRef = useRef({ x: 0, y: 0, origX: 0, origY: 0 });
 
+  // Track right-click drag vs click
+  const rightDragRef = useRef<{
+    startX: number;
+    startY: number;
+    origPanX: number;
+    origPanY: number;
+    hasDragged: boolean;
+  } | null>(null);
+
   const draggingFrameRef = useRef<{
     id: string;
     startClientX: number;
@@ -136,7 +155,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     return () => window.removeEventListener("click", handleDismiss);
   }, []);
 
-  // Track Spacebar for pan mode, or shortcut 'D' for debug HUD, 'Escape' to exit Shot Edit Mode
+  // Track Spacebar for pan mode, or shortcut 'D' for debug HUD, 'Escape' to cancel
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (
@@ -153,6 +172,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         setContextMenu(null);
         setLinkingFromId(null);
         setEditingShotId(null);
+        setWireDrag(null);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -166,34 +186,32 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     };
   }, [handleToggleDebug]);
 
-  // Wheel zoom & two-finger trackpad pan
+  /**
+   * Natural Wheel-to-Zoom:
+   * Scrolling mouse wheel directly zooms in and out of the infinite canvas anchored
+   * to cursor position (standard FigJam / Miro / Excalidraw behavior, no Ctrl needed).
+   */
   const handleWheel = useCallback(
     (e: React.WheelEvent<HTMLDivElement>) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) {
-        e.preventDefault();
-        const rect = containerRef.current?.getBoundingClientRect();
-        if (!rect) return;
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
+      e.preventDefault();
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
 
-        const factor = e.deltaY < 0 ? 1.1 : 0.9;
-        const nextZoom = Math.min(2.8, Math.max(0.18, zoom * factor));
+      const delta = Math.max(-120, Math.min(120, e.deltaY));
+      const factor = delta < 0 ? 1.09 : 0.91;
+      const nextZoom = Math.min(3.5, Math.max(0.12, zoom * factor));
 
-        // Zoom toward cursor position
-        const worldX = (mouseX - pan.x) / zoom;
-        const worldY = (mouseY - pan.y) / zoom;
+      // Zoom centered directly around mouse cursor
+      const worldX = (mouseX - pan.x) / zoom;
+      const worldY = (mouseY - pan.y) / zoom;
 
-        setZoom(nextZoom);
-        setPan({
-          x: mouseX - worldX * nextZoom,
-          y: mouseY - worldY * nextZoom,
-        });
-      } else {
-        setPan((prev) => ({
-          x: prev.x - e.deltaX,
-          y: prev.y - e.deltaY,
-        }));
-      }
+      setZoom(nextZoom);
+      setPan({
+        x: mouseX - worldX * nextZoom,
+        y: mouseY - worldY * nextZoom,
+      });
     },
     [pan, zoom]
   );
@@ -219,6 +237,13 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   // Right-click on infinite background to add a shot frame at exact world position
   const handleContextMenu = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
+      // If right-drag was used to pan, suppress context menu
+      if (rightDragRef.current?.hasDragged) {
+        e.preventDefault();
+        rightDragRef.current = null;
+        return;
+      }
+
       const target = e.target as HTMLElement;
       const isBg =
         target === containerRef.current ||
@@ -249,6 +274,18 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     if (contextMenu) setContextMenu(null);
     if (linkingFromId) setLinkingFromId(null);
 
+    // Right-button drag start
+    if (e.button === 2) {
+      rightDragRef.current = {
+        startX: e.clientX,
+        startY: e.clientY,
+        origPanX: pan.x,
+        origPanY: pan.y,
+        hasDragged: false,
+      };
+      return;
+    }
+
     // Middle click, Space+Click, or clicking directly on the infinite background
     if (e.button === 1 || spacePressed || e.target === e.currentTarget) {
       isPanningRef.current = true;
@@ -267,6 +304,21 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   };
 
   const handleBoardPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Handle right-button drag panning
+    if (rightDragRef.current) {
+      const dx = e.clientX - rightDragRef.current.startX;
+      const dy = e.clientY - rightDragRef.current.startY;
+      if (Math.hypot(dx, dy) > 5) {
+        rightDragRef.current.hasDragged = true;
+        setPan({
+          x: rightDragRef.current.origPanX + dx,
+          y: rightDragRef.current.origPanY + dy,
+        });
+      }
+      return;
+    }
+
+    // Handle middle/space panning
     if (isPanningRef.current) {
       const dx = e.clientX - panStartRef.current.x;
       const dy = e.clientY - panStartRef.current.y;
@@ -277,6 +329,36 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
       return;
     }
 
+    // Handle interactive wire dragging across frames
+    if (wireDrag) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const currentWorldX = (e.clientX - rect.left - pan.x) / zoom;
+      const currentWorldY = (e.clientY - rect.top - pan.y) / zoom;
+
+      const target = frames.find(
+        (f) =>
+          f.id !== wireDrag.fromFrameId &&
+          currentWorldX >= f.x - 20 &&
+          currentWorldX <= f.x + f.width + 20 &&
+          currentWorldY >= f.y - 20 &&
+          currentWorldY <= f.y + f.height + 20
+      );
+
+      setWireDrag((prev) =>
+        prev
+          ? {
+              ...prev,
+              currentWorldX,
+              currentWorldY,
+              targetFrameId: target ? target.id : null,
+            }
+          : null
+      );
+      return;
+    }
+
+    // Handle frame card movement
     if (draggingFrameRef.current) {
       const { id, startClientX, startClientY, origX, origY } = draggingFrameRef.current;
       const dx = (e.clientX - startClientX) / zoom;
@@ -296,6 +378,15 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         // ignore
       }
     }
+
+    // Wire dragging completion
+    if (wireDrag) {
+      if (wireDrag.targetFrameId && wireDrag.targetFrameId !== wireDrag.fromFrameId) {
+        onUpdateFrameMeta(wireDrag.fromFrameId, { nextFrameId: wireDrag.targetFrameId });
+      }
+      setWireDrag(null);
+    }
+
     draggingFrameRef.current = null;
   };
 
@@ -311,6 +402,8 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
       fromId: string;
       toId: string;
       isManual: boolean;
+      midX: number;
+      midY: number;
     }[] = [];
 
     const explicitLinked = new Set<string>();
@@ -328,11 +421,16 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         const dx = endX - startX;
         const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
 
+        const midX = (startX + endX) / 2;
+        const midY = (startY + endY) / 2;
+
         connectors.push({
           id: `conn_manual_${from.id}_${to.id}`,
           fromId: from.id,
           toId: to.id,
           isManual: true,
+          midX,
+          midY,
           d: `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`,
           label: `${from.shotNumber} ➔ ${to.shotNumber}`,
         });
@@ -351,11 +449,16 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         const dx = endX - startX;
         const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
 
+        const midX = (startX + endX) / 2;
+        const midY = (startY + endY) / 2;
+
         connectors.push({
           id: `conn_seq_${from.id}_${to.id}`,
           fromId: from.id,
           toId: to.id,
           isManual: false,
+          midX,
+          midY,
           d: `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`,
           label: `${from.shotNumber} ➔ ${to.shotNumber}`,
         });
@@ -383,7 +486,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         touchAction: "none",
         userSelect: "none",
         WebkitUserSelect: "none",
-        cursor: spacePressed ? "grab" : "default",
+        cursor: spacePressed ? "grab" : wireDrag ? "crosshair" : "default",
       }}
     >
       {/* Background Dot Matrix Grid */}
@@ -429,58 +532,139 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         }}
       >
         {/* SVG Cinematic Sequence Connectors Layer */}
-        {sequenceConnectors.length > 0 && (
-          <svg
-            style={{
-              position: "absolute",
-              overflow: "visible",
-              pointerEvents: "none",
-              zIndex: 1,
-            }}
-          >
-            <defs>
-              <marker
-                id="sequence_arrow"
-                viewBox="0 0 10 10"
-                refX="7"
-                refY="5"
-                markerWidth="6"
-                markerHeight="6"
-                orient="auto-start-reverse"
-              >
-                <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#6366f1" />
-              </marker>
-              <marker
-                id="sequence_arrow_manual"
-                viewBox="0 0 10 10"
-                refX="7"
-                refY="5"
-                markerWidth="7"
-                markerHeight="7"
-                orient="auto-start-reverse"
-              >
-                <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#10b981" />
-              </marker>
-            </defs>
-            {sequenceConnectors.map((c) => (
-              <g key={c.id}>
-                <path
-                  d={c.d}
-                  fill="none"
-                  stroke={c.isManual ? "#10b981" : "#6366f1"}
-                  strokeWidth={c.isManual ? 3 : 2}
-                  strokeDasharray={c.isManual ? "none" : "6 4"}
-                  markerEnd={
-                    c.isManual
-                      ? "url(#sequence_arrow_manual)"
-                      : "url(#sequence_arrow)"
-                  }
-                  opacity={c.isManual ? 0.9 : 0.65}
+        <svg
+          style={{
+            position: "absolute",
+            overflow: "visible",
+            pointerEvents: "none",
+            zIndex: 5,
+          }}
+        >
+          <defs>
+            <marker
+              id="sequence_arrow"
+              viewBox="0 0 10 10"
+              refX="7"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#6366f1" />
+            </marker>
+            <marker
+              id="sequence_arrow_manual"
+              viewBox="0 0 10 10"
+              refX="7"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#10b981" />
+            </marker>
+            <marker
+              id="wire_arrow_drag"
+              viewBox="0 0 10 10"
+              refX="7"
+              refY="5"
+              markerWidth="8"
+              markerHeight="8"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#38bdf8" />
+            </marker>
+          </defs>
+
+          {/* Established Block-to-Block Connecting Arrows */}
+          {sequenceConnectors.map((c) => (
+            <g key={c.id}>
+              <path
+                d={c.d}
+                fill="none"
+                stroke={c.isManual ? "#10b981" : "#6366f1"}
+                strokeWidth={c.isManual ? 3 : 2}
+                strokeDasharray={c.isManual ? "none" : "6 4"}
+                markerEnd={
+                  c.isManual
+                    ? "url(#sequence_arrow_manual)"
+                    : "url(#sequence_arrow)"
+                }
+                opacity={c.isManual ? 0.9 : 0.65}
+              />
+              {/* Interactive badge on connecting arrow with unlink button */}
+              {c.isManual && (
+                <g
+                  transform={`translate(${c.midX}, ${c.midY})`}
+                  style={{ pointerEvents: "all", cursor: "pointer" }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUpdateFrameMeta(c.fromId, { nextFrameId: undefined });
+                  }}
+                >
+                  <title>Click to remove sequence link</title>
+                  <rect
+                    x={-44}
+                    y={-12}
+                    width={88}
+                    height={24}
+                    rx={12}
+                    fill="#18181c"
+                    stroke="#10b981"
+                    strokeWidth={1.5}
+                  />
+                  <text
+                    x={-28}
+                    y={4}
+                    fill="#10b981"
+                    fontSize={10}
+                    fontWeight={700}
+                    fontFamily="monospace"
+                  >
+                    {c.label}
+                  </text>
+                  <text
+                    x={26}
+                    y={4}
+                    fill="#ef4444"
+                    fontSize={11}
+                    fontWeight={800}
+                  >
+                    ✕
+                  </text>
+                </g>
+              )}
+            </g>
+          ))}
+
+          {/* Interactive In-Flight Wire Arrow Dragging */}
+          {wireDrag && (
+            <g>
+              <path
+                d={(() => {
+                  const dx = wireDrag.currentWorldX - wireDrag.fromX;
+                  const ctrl = Math.max(60, Math.abs(dx) * 0.5);
+                  return `M ${wireDrag.fromX} ${wireDrag.fromY} C ${wireDrag.fromX + ctrl} ${wireDrag.fromY}, ${wireDrag.currentWorldX - ctrl} ${wireDrag.currentWorldY}, ${wireDrag.currentWorldX} ${wireDrag.currentWorldY}`;
+                })()}
+                fill="none"
+                stroke={wireDrag.targetFrameId ? "#10b981" : "#38bdf8"}
+                strokeWidth={3}
+                strokeDasharray="6 4"
+                markerEnd="url(#wire_arrow_drag)"
+                opacity={0.9}
+              />
+              {wireDrag.targetFrameId && (
+                <circle
+                  cx={wireDrag.currentWorldX}
+                  cy={wireDrag.currentWorldY}
+                  r={8}
+                  fill="#10b981"
+                  opacity={0.6}
                 />
-              </g>
-            ))}
-          </svg>
-        )}
+              )}
+            </g>
+          )}
+        </svg>
 
         {/* Frames Layer */}
         {frames.map((frame, index) => {
@@ -488,6 +672,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
           const isShotEditMode = editingShotId === frame.id;
           const intraZoom = shotZoomMap[frame.id] ?? 1;
           const prevFrame = index > 0 ? frames[index - 1] : undefined;
+          const isWireTarget = wireDrag?.targetFrameId === frame.id;
 
           return (
             <div
@@ -502,14 +687,58 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                 width: frame.width,
                 borderRadius: 12,
                 backgroundColor: "#18181c",
-                boxShadow: isShotEditMode
-                  ? "0 0 0 3px #10b981, 0 30px 60px -10px rgba(0,0,0,0.85)"
-                  : isActive
-                    ? "0 0 0 3px #6366f1, 0 25px 50px -12px rgba(0,0,0,0.75)"
-                    : "0 0 0 1px rgba(255,255,255,0.12), 0 15px 30px -10px rgba(0,0,0,0.6)",
+                boxShadow: isWireTarget
+                  ? "0 0 0 4px #10b981, 0 0 30px rgba(16,185,129,0.7)"
+                  : isShotEditMode
+                    ? "0 0 0 3px #10b981, 0 30px 60px -10px rgba(0,0,0,0.85)"
+                    : isActive
+                      ? "0 0 0 3px #6366f1, 0 25px 50px -12px rgba(0,0,0,0.75)"
+                      : "0 0 0 1px rgba(255,255,255,0.12), 0 15px 30px -10px rgba(0,0,0,0.6)",
                 transition: "box-shadow 0.15s ease",
               }}
             >
+              {/* Visual Block Connector Port (Miro/FigJam Link Handle) */}
+              <div
+                title="Click & drag arrow to link & serialise next shot block"
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  const startX = frame.x + frame.width;
+                  const startY = frame.y + frame.height / 2;
+                  setWireDrag({
+                    fromFrameId: frame.id,
+                    fromX: startX,
+                    fromY: startY,
+                    currentWorldX: startX,
+                    currentWorldY: startY,
+                    targetFrameId: null,
+                  });
+                }}
+                style={{
+                  position: "absolute",
+                  right: -14,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  width: 26,
+                  height: 26,
+                  borderRadius: "50%",
+                  backgroundColor: frame.nextFrameId ? "#10b981" : "#6366f1",
+                  border: "2px solid #ffffff",
+                  color: "#ffffff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  boxShadow: "0 0 12px rgba(99,102,241,0.8)",
+                  cursor: "crosshair",
+                  zIndex: 25,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  userSelect: "none",
+                  transition: "transform 0.12s ease",
+                }}
+              >
+                ➔
+              </div>
+
               {/* Drag Handle & Shot Metadata Bar */}
               <div
                 onPointerDown={(e) => {
@@ -638,7 +867,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                       cursor: "pointer",
                     }}
                   >
-                    {frame.nextFrameId ? `➔ Linked` : `➔ Join`}
+                    {frame.nextFrameId ? `➔ Linked` : `➔ Link`}
                   </button>
 
                   <button
@@ -863,7 +1092,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                       marginBottom: 6,
                     }}
                   >
-                    Join {frame.shotNumber} to Next Shot:
+                    Link {frame.shotNumber} to Shot:
                   </div>
                   <div
                     style={{
@@ -1045,7 +1274,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         </button>
 
         <span style={{ color: "#71717a", marginLeft: 6, fontSize: 11 }}>
-          Right-Click to Add Shot • Space+Drag • Double-Click Shot to Zoom
+          Scroll: Zoom Canvas • Drag ➔ to Link Shots • Right-Click: Add Shot
         </span>
       </div>
 
