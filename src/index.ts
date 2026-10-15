@@ -65,3 +65,14 @@ export { BackgroundLayer, type BackgroundLayerProps } from "./components/Backgro
 export { StoryboardFrame, type StoryboardFrameProps } from "./components/StoryboardFrame";
 export { InfiniteBoard, type InfiniteBoardProps } from "./components/InfiniteBoard";
 export { StoryboardStudio, type StoryboardStudioProps } from "./components/StoryboardStudio";
+export { DrawingDebugOverlay, type DrawingDebugOverlayProps } from "./components/DrawingDebugOverlay";
+export { DrawingDebugHUD, type DrawingDebugHUDProps } from "./components/DrawingDebugHUD";
+
+// Debug & Diagnostics Telemetry
+export {
+  PointerEventRingBuffer,
+  globalPointerRingBuffer,
+  type LiveStrokeStats,
+  type PointerLifecycle,
+  type PointerLogEvent,
+} from "./core/debug";

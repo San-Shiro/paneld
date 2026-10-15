@@ -136,6 +136,7 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
   const [showSequenceArrows, setShowSequenceArrows] = useState<boolean>(true);
   const [snapshotLabel, setSnapshotLabel] = useState<string>("");
 
+  const [debugMode, setDebugMode] = useState<boolean>(false);
   // Collaboration Presence
   const [collaborators, setCollaborators] = useState<Map<string, CollaboratorPresence>>(
     new Map()
@@ -727,6 +728,34 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
           </button>
           <button
             type="button"
+            onClick={() => setDebugMode((d) => !d)}
+            style={{
+              padding: "6px 11px",
+              borderRadius: 7,
+              border: debugMode ? "1px solid #10b981" : "1px solid rgba(255,255,255,0.1)",
+              background: debugMode ? "rgba(16,185,129,0.2)" : "#1c1c22",
+              color: debugMode ? "#34d399" : "#a1a1aa",
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+            }}
+            title="Toggle Drawing Diagnostics & Telemetry HUD (Shortcut: D)"
+          >
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                backgroundColor: debugMode ? "#10b981" : "#71717a",
+              }}
+            />
+            Debug HUD
+          </button>
+          <button
+            type="button"
             onClick={handleAddShot}
             style={{
               padding: "6px 12px",
@@ -757,6 +786,8 @@ export const StoryboardStudio: React.FC<StoryboardStudioProps> = ({
             onionSkinEnabled={onionSkinEnabled}
             showSequenceArrows={showSequenceArrows}
             remoteCollaborators={remoteCollaboratorsList}
+            debugMode={debugMode}
+            onToggleDebug={() => setDebugMode((d) => !d)}
             onSelectFrame={setActiveFrameId}
             onMoveFrame={(id, x, y) => handleUpdateFrameMeta(id, { x, y })}
             onUpdateFrameMeta={handleUpdateFrameMeta}

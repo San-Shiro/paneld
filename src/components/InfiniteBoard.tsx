@@ -6,6 +6,12 @@ import type {
   StoryboardToolId,
 } from "../core/types";
 import { StoryboardFrame } from "./StoryboardFrame";
+import {
+  globalPointerRingBuffer,
+  type LiveStrokeStats,
+  type PointerLogEvent,
+} from "../core/debug";
+import { DrawingDebugHUD } from "./DrawingDebugHUD";
 
 export interface InfiniteBoardProps {
   frames: StoryboardFrameData[];
@@ -17,6 +23,8 @@ export interface InfiniteBoardProps {
   onionSkinEnabled: boolean;
   showSequenceArrows: boolean;
   remoteCollaborators: CollaboratorPresence[];
+  debugMode?: boolean;
+  onToggleDebug?: () => void;
   onSelectFrame: (frameId: string) => void;
   onMoveFrame: (frameId: string, x: number, y: number) => void;
   onUpdateFrameMeta: (frameId: string, patch: Partial<StoryboardFrameData>) => void;
@@ -42,6 +50,8 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   onionSkinEnabled,
   showSequenceArrows,
   remoteCollaborators,
+  debugMode: parentDebugMode,
+  onToggleDebug,
   onSelectFrame,
   onMoveFrame,
   onUpdateFrameMeta,
@@ -56,6 +66,36 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
   const [zoom, setZoom] = useState(0.75);
   const [spacePressed, setSpacePressed] = useState(false);
 
+  // Internal debug mode toggle fallback
+  const [internalDebugMode, setInternalDebugMode] = useState(false);
+  const isDebugActive = parentDebugMode !== undefined ? parentDebugMode : internalDebugMode;
+
+  const handleToggleDebug = useCallback(() => {
+    if (onToggleDebug) {
+      onToggleDebug();
+    } else {
+      setInternalDebugMode((prev) => !prev);
+    }
+  }, [onToggleDebug]);
+
+  // Debug telemetry state
+  const [debugEvents, setDebugEvents] = useState<PointerLogEvent[]>([]);
+  const [debugStats, setDebugStats] = useState<LiveStrokeStats | null>(null);
+  const [lastDebugEvent, setLastDebugEvent] = useState<PointerLogEvent | null>(null);
+
+  // Poll ring buffer periodically when debug mode is enabled
+  useEffect(() => {
+    if (!isDebugActive) return;
+    const interval = setInterval(() => {
+      const all = globalPointerRingBuffer.getAll();
+      setDebugEvents(all);
+      if (all.length > 0) {
+        setLastDebugEvent(all[all.length - 1] ?? null);
+      }
+    }, 120);
+    return () => clearInterval(interval);
+  }, [isDebugActive]);
+
   const isPanningRef = useRef(false);
   const panStartRef = useRef({ x: 0, y: 0, origX: 0, origY: 0 });
 
@@ -67,15 +107,19 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     origY: number;
   } | null>(null);
 
-  // Track Spacebar for pan mode
+  // Track Spacebar for pan mode, or shortcut 'D' for debug HUD
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (
-        e.code === "Space" &&
-        document.activeElement?.tagName !== "INPUT" &&
-        document.activeElement?.tagName !== "TEXTAREA"
+        document.activeElement?.tagName === "INPUT" ||
+        document.activeElement?.tagName === "TEXTAREA"
       ) {
+        return;
+      }
+      if (e.code === "Space") {
         setSpacePressed(true);
+      } else if (e.key === "d" || e.key === "D") {
+        handleToggleDebug();
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -87,7 +131,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, []);
+  }, [handleToggleDebug]);
 
   // Wheel zoom & two-finger trackpad pan
   const handleWheel = useCallback(
@@ -149,7 +193,11 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         origX: pan.x,
         origY: pan.y,
       };
-      e.currentTarget.setPointerCapture(e.pointerId);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -172,10 +220,47 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
     }
   };
 
-  const handleBoardPointerUp = () => {
-    isPanningRef.current = false;
+  const handleBoardPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isPanningRef.current) {
+      isPanningRef.current = false;
+      try {
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // ignore
+      }
+    }
     draggingFrameRef.current = null;
   };
+
+  // Build sequential cinematic flow arrows connecting frames
+  const sequenceConnectors = React.useMemo(() => {
+    if (!showSequenceArrows || frames.length < 2) return [];
+
+    const connectors: { id: string; d: string; label: string }[] = [];
+    for (let i = 0; i < frames.length - 1; i++) {
+      const from = frames[i]!;
+      const to = frames[i + 1]!;
+
+      // Connect right edge of from-frame to left edge of to-frame
+      const startX = from.x + from.width;
+      const startY = from.y + from.height / 2;
+      const endX = to.x;
+      const endY = to.y + to.height / 2;
+
+      const dx = endX - startX;
+      const ctrlDist = Math.max(60, Math.abs(dx) * 0.5);
+
+      const d = `M ${startX} ${startY} C ${startX + ctrlDist} ${startY}, ${endX - ctrlDist} ${endY}, ${endX} ${endY}`;
+      connectors.push({
+        id: `conn_${from.id}_${to.id}`,
+        d,
+        label: `${from.shotNumber} ➔ ${to.shotNumber}`,
+      });
+    }
+    return connectors;
+  }, [frames, showSequenceArrows]);
 
   return (
     <div
@@ -184,84 +269,97 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
       onPointerDown={handleBoardPointerDown}
       onPointerMove={handleBoardPointerMove}
       onPointerUp={handleBoardPointerUp}
+      onPointerCancel={handleBoardPointerUp}
       style={{
-        position: "relative",
         width: "100%",
         height: "100%",
         overflow: "hidden",
-        backgroundColor: "#0c0c0f",
-        backgroundImage:
-          "radial-gradient(rgba(255,255,255,0.1) 1px, transparent 1px)",
-        backgroundSize: `${28 * zoom}px ${28 * zoom}px`,
-        backgroundPosition: `${pan.x}px ${pan.y}px`,
-        cursor: spacePressed || isPanningRef.current ? "grabbing" : "default",
+        position: "relative",
+        backgroundColor: "#0d0d11",
+        touchAction: "none",
         userSelect: "none",
+        WebkitUserSelect: "none",
+        cursor: spacePressed ? "grab" : "default",
       }}
     >
-      {/* World Space Transform Plane */}
+      {/* Background Dot Matrix Grid */}
+      <svg
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          opacity: 0.16,
+        }}
+      >
+        <defs>
+          <pattern
+            id="infinite_board_grid"
+            width={40 * zoom}
+            height={40 * zoom}
+            patternUnits="userSpaceOnUse"
+            patternTransform={`translate(${pan.x % (40 * zoom)}, ${pan.y % (40 * zoom)})`}
+          >
+            <circle cx={2} cy={2} r={1.2} fill="#ffffff" />
+          </pattern>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#infinite_board_grid)" />
+      </svg>
+
+      {/* World Space Container (Pan & Zoomed) */}
       <div
         style={{
+          transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          transformOrigin: "0 0",
           position: "absolute",
           top: 0,
           left: 0,
-          transformOrigin: "0 0",
-          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
-          pointerEvents: spacePressed ? "none" : "auto",
+          willChange: "transform",
         }}
       >
-        {/* Sequence Flow Arrows Between Shots */}
-        {showSequenceArrows && frames.length > 1 && (
+        {/* SVG Cinematic Sequence Connectors Layer */}
+        {sequenceConnectors.length > 0 && (
           <svg
             style={{
               position: "absolute",
-              top: -5000,
-              left: -5000,
-              width: 20000,
-              height: 20000,
-              pointerEvents: "none",
               overflow: "visible",
+              pointerEvents: "none",
+              zIndex: 1,
             }}
           >
             <defs>
               <marker
-                id="seq-arrow"
+                id="sequence_arrow"
                 viewBox="0 0 10 10"
-                refX="6"
+                refX="7"
                 refY="5"
                 markerWidth="6"
                 markerHeight="6"
                 orient="auto-start-reverse"
               >
-                <path d="M 0 1 L 10 5 L 0 9 z" fill="#6366f1" />
+                <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#6366f1" />
               </marker>
             </defs>
-            {frames.slice(0, -1).map((curr, idx) => {
-              const next = frames[idx + 1]!;
-              const x1 = 5000 + curr.x + curr.width;
-              const y1 = 5000 + curr.y + curr.height / 2;
-              const x2 = 5000 + next.x;
-              const y2 = 5000 + next.y + next.height / 2;
-              const cx1 = x1 + Math.max(60, Math.abs(x2 - x1) * 0.35);
-              const cx2 = x2 - Math.max(60, Math.abs(x2 - x1) * 0.35);
-              return (
+            {sequenceConnectors.map((c) => (
+              <g key={c.id}>
                 <path
-                  key={`seq_${curr.id}_${next.id}`}
-                  d={`M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`}
+                  d={c.d}
                   fill="none"
                   stroke="#6366f1"
                   strokeWidth={2.5}
-                  strokeDasharray="8 6"
-                  opacity={0.55}
-                  markerEnd="url(#seq-arrow)"
+                  strokeDasharray="6 4"
+                  markerEnd="url(#sequence_arrow)"
+                  opacity={0.65}
                 />
-              );
-            })}
+              </g>
+            ))}
           </svg>
         )}
 
-        {/* Storyboard Frame Cards */}
+        {/* Frames Layer */}
         {frames.map((frame, index) => {
-          const isActive = frame.id === activeFrameId;
+          const isActive = activeFrameId === frame.id;
           const prevFrame = index > 0 ? frames[index - 1] : undefined;
 
           return (
@@ -392,7 +490,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                       cursor: "pointer",
                     }}
                   >
-                    Clone
+                    Duplicate
                   </button>
                   {frames.length > 1 && (
                     <button
@@ -425,6 +523,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                   height: frame.height,
                   position: "relative",
                   overflow: "hidden",
+                  touchAction: "none",
                 }}
               >
                 <StoryboardFrame
@@ -438,9 +537,18 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
                     isActive && onionSkinEnabled ? prevFrame?.strokes : undefined
                   }
                   remoteCollaborators={remoteCollaborators}
+                  debugMode={isActive && isDebugActive}
                   onCommitStroke={onCommitStroke}
                   onEraseStroke={onEraseStroke}
                   onInFlightMove={onInFlightMove}
+                  onDebugStatsChange={(stats) => {
+                    setDebugStats(stats);
+                    const all = globalPointerRingBuffer.getAll();
+                    setDebugEvents(all);
+                    if (all.length > 0) {
+                      setLastDebugEvent(all[all.length - 1] ?? null);
+                    }
+                  }}
                 />
 
                 {!isActive && (
@@ -496,7 +604,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         })}
       </div>
 
-      {/* Floating Infinite Canvas Navigation Controls */}
+      {/* Floating Infinite Canvas Navigation & Debug Controls */}
       <div
         style={{
           position: "absolute",
@@ -512,6 +620,7 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
           color: "#e4e4e7",
           fontSize: 12,
           backdropFilter: "blur(8px)",
+          zIndex: 10,
         }}
       >
         <button
@@ -566,10 +675,60 @@ export const InfiniteBoard: React.FC<InfiniteBoardProps> = ({
         >
           Reset View
         </button>
+
+        {/* Debug HUD Toggle Button */}
+        <button
+          type="button"
+          onClick={handleToggleDebug}
+          style={{
+            background: isDebugActive
+              ? "rgba(16, 185, 129, 0.25)"
+              : "rgba(255, 255, 255, 0.08)",
+            border: isDebugActive
+              ? "1px solid #10b981"
+              : "1px solid rgba(255,255,255,0.12)",
+            color: isDebugActive ? "#34d399" : "#a1a1aa",
+            borderRadius: 5,
+            padding: "4px 8px",
+            fontSize: 11,
+            fontWeight: 600,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+          }}
+          title="Toggle Drawing Telemetry & Debug HUD (Key: D)"
+        >
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              backgroundColor: isDebugActive ? "#10b981" : "#71717a",
+            }}
+          />
+          Debug HUD
+        </button>
+
         <span style={{ color: "#71717a", marginLeft: 6, fontSize: 11 }}>
-          Hold [Space] + Drag or Scroll to Pan • [Ctrl+Wheel] Zoom
+          Hold [Space] + Drag • [D] Debug
         </span>
       </div>
+
+      {/* Floating Real-Time Diagnostics HUD Panel */}
+      <DrawingDebugHUD
+        enabled={isDebugActive}
+        onToggle={handleToggleDebug}
+        onClearLogs={() => {
+          globalPointerRingBuffer.clear();
+          setDebugEvents([]);
+          setLastDebugEvent(null);
+        }}
+        events={debugEvents}
+        stats={debugStats}
+        lastEvent={lastDebugEvent}
+        activeFrameId={activeFrameId}
+      />
     </div>
   );
 };

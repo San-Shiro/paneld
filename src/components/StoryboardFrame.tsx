@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { renderStrokeToSvgPath } from "../core/freehand";
 import { BRUSH_PRESETS } from "../core/presets";
 import {
@@ -8,6 +8,10 @@ import {
   simplifyPoints,
   type Point2D,
 } from "../core/simplify";
+import {
+  globalPointerRingBuffer,
+  type LiveStrokeStats,
+} from "../core/debug";
 import type {
   CollaboratorPresence,
   CompactStroke,
@@ -15,6 +19,7 @@ import type {
   StoryboardToolId,
 } from "../core/types";
 import { BackgroundLayer } from "./BackgroundLayer";
+import { DrawingDebugOverlay } from "./DrawingDebugOverlay";
 
 export interface StoryboardFrameProps {
   frame: StoryboardFrameData;
@@ -25,6 +30,7 @@ export interface StoryboardFrameProps {
   stabilizerRadius?: number;
   onionSkinStrokes?: CompactStroke[];
   remoteCollaborators?: CollaboratorPresence[];
+  debugMode?: boolean;
   onCommitStroke?: (frameId: string, stroke: CompactStroke) => void;
   onEraseStroke?: (frameId: string, strokeId: string) => void;
   onInFlightMove?: (
@@ -33,6 +39,7 @@ export interface StoryboardFrameProps {
     y: number,
     inFlightStroke: CompactStroke | null
   ) => void;
+  onDebugStatsChange?: (stats: LiveStrokeStats | null) => void;
   className?: string;
 }
 
@@ -66,17 +73,28 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
   stabilizerRadius = 6,
   onionSkinStrokes,
   remoteCollaborators = [],
+  debugMode = false,
   onCommitStroke,
   onEraseStroke,
   onInFlightMove,
+  onDebugStatsChange,
   className = "",
 }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // Robust pointer tracking refs
+  const activePointerIdRef = useRef<number | null>(null);
   const isDrawingRef = useRef(false);
+  const captureHeldRef = useRef(false);
+  const finishingRef = useRef(false);
+
   const rawPointsRef = useRef<Point2D[]>([]);
   const stabilizerRef = useRef(new LazyBrushStabilizer(stabilizerRadius));
   const [inFlightStroke, setInFlightStroke] = useState<CompactStroke | null>(null);
   const [cursorPos, setCursorPos] = useState<Point2D | null>(null);
+
+  // Live debug stroke telemetry
+  const strokeStatsRef = useRef<LiveStrokeStats | null>(null);
 
   const preset = BRUSH_PRESETS[activeTool] ?? BRUSH_PRESETS.ink;
   const effectiveColor = strokeColor || preset.defaultColor;
@@ -99,10 +117,28 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
     return { pencil, tone, ink, notes };
   }, [frame.strokes]);
 
+  /**
+   * Convert screen (clientX, clientY) to SVG frame coordinates using CTM
+   * (Screen Current Transformation Matrix). This immune-shields coordinates against
+   * infinite canvas pan/zoom transforms and CSS scaling on both mobile and desktop.
+   */
   const toFrameCoords = useCallback(
     (clientX: number, clientY: number): Point2D => {
       const svg = svgRef.current;
       if (!svg) return { x: 0, y: 0 };
+
+      try {
+        const ctm = svg.getScreenCTM();
+        if (ctm) {
+          const pt = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
+          if (Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+            return { x: pt.x, y: pt.y };
+          }
+        }
+      } catch {
+        // Fallback to bounding rect if CTM inversion encounters singular matrix
+      }
+
       const rect = svg.getBoundingClientRect();
       const scaleX = frame.width / (rect.width || 1);
       const scaleY = frame.height / (rect.height || 1);
@@ -114,14 +150,73 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
     [frame.width, frame.height]
   );
 
+  const checkInBounds = useCallback(
+    (pt: Point2D) => {
+      return pt.x >= 0 && pt.x <= frame.width && pt.y >= 0 && pt.y <= frame.height;
+    },
+    [frame.width, frame.height]
+  );
+
+  // Safe pointer capture release helper
+  const releaseCaptureSafely = useCallback((el: SVGSVGElement | null, pointerId: number) => {
+    if (!el) return;
+    try {
+      if (typeof el.hasPointerCapture === "function" && el.hasPointerCapture(pointerId)) {
+        el.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignorable browser capture release edge-cases
+    }
+    captureHeldRef.current = false;
+  }, []);
+
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
-      if (!interactive || e.button !== 0) return;
+      if (!interactive) return;
+
+      // For mouse input, allow primary button only; for touch/pen allow primary touch
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+
+      // If another pointer is already drawing, do not preempt or corrupt active stroke
+      if (activePointerIdRef.current !== null && activePointerIdRef.current !== e.pointerId) {
+        return;
+      }
+
       e.stopPropagation();
-      e.currentTarget.setPointerCapture(e.pointerId);
 
       const pt = toFrameCoords(e.clientX, e.clientY);
+      const inBounds = checkInBounds(pt);
+
+      // Acquire pointer capture on the SVG element
+      activePointerIdRef.current = e.pointerId;
       isDrawingRef.current = true;
+      finishingRef.current = false;
+
+      let captureStatus: "requested" | "held" | "error" = "requested";
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        captureHeldRef.current = e.currentTarget.hasPointerCapture(e.pointerId);
+        captureStatus = captureHeldRef.current ? "held" : "requested";
+      } catch {
+        captureHeldRef.current = false;
+        captureStatus = "error";
+      }
+
+      // Log DOWN event to RingBuffer
+      globalPointerRingBuffer.push("DOWN", {
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        isPrimary: e.isPrimary,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        frameX: pt.x,
+        frameY: pt.y,
+        inBounds,
+        pressure: e.pressure,
+        buttons: e.buttons,
+        capture: captureStatus,
+        detail: `tool: ${activeTool}`,
+      });
 
       if (activeTool === "eraser") {
         for (let i = frame.strokes.length - 1; i >= 0; i--) {
@@ -140,8 +235,9 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
       const startPt = stabilizerRef.current.reset(pt.x, pt.y);
       rawPointsRef.current = [startPt];
 
+      const strokeId = `st_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
       const draft: CompactStroke = {
-        id: `st_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        id: strokeId,
         tool: activeTool,
         layer: preset.layer,
         color: effectiveColor,
@@ -150,6 +246,24 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
         pts: [startPt.x, startPt.y],
         seed: Math.floor(Math.random() * 100000),
       };
+
+      // Initialize live stats for debug HUD
+      const initialStats: LiveStrokeStats = {
+        strokeId,
+        tool: activeTool,
+        layer: preset.layer,
+        rawPointCount: 1,
+        simplifiedPointCount: 1,
+        inFlightPointCount: 1,
+        pathLength: 0,
+        estimatedBytes: 32,
+        stabilizerActive: stabilizerRadius > 0,
+        pressureMin: e.pressure || 0.5,
+        pressureMax: e.pressure || 0.5,
+        bbox: { minX: startPt.x, minY: startPt.y, maxX: startPt.x, maxY: startPt.y },
+      };
+      strokeStatsRef.current = initialStats;
+      onDebugStatsChange?.(initialStats);
 
       setInFlightStroke(draft);
       onInFlightMove?.(frame.id, pt.x, pt.y, draft);
@@ -164,19 +278,28 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
       frame.id,
       frame.strokes,
       toFrameCoords,
+      checkInBounds,
       onEraseStroke,
       onInFlightMove,
+      onDebugStatsChange,
     ]
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
       if (!interactive) return;
+
       const pt = toFrameCoords(e.clientX, e.clientY);
       setCursorPos(pt);
 
+      // If hovering without drawing
       if (!isDrawingRef.current) {
         onInFlightMove?.(frame.id, pt.x, pt.y, null);
+        return;
+      }
+
+      // If this pointer is not the active drawing pointer, ignore it
+      if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) {
         return;
       }
 
@@ -193,12 +316,19 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
         return;
       }
 
-      // Extract coalesced high-frequency events when supported by browser
+      // Extract high-frequency coalesced events from browser pointer hardware
       const nativeEvt = e.nativeEvent as PointerEvent;
       const coalesced =
         typeof nativeEvt.getCoalescedEvents === "function"
           ? nativeEvt.getCoalescedEvents()
           : [nativeEvt];
+
+      const coalescedCount = coalesced.length;
+      let minX = strokeStatsRef.current?.bbox?.minX ?? pt.x;
+      let minY = strokeStatsRef.current?.bbox?.minY ?? pt.y;
+      let maxX = strokeStatsRef.current?.bbox?.maxX ?? pt.x;
+      let maxY = strokeStatsRef.current?.bbox?.maxY ?? pt.y;
+      let addedLength = 0;
 
       for (const ce of coalesced) {
         const subPt = toFrameCoords(ce.clientX, ce.clientY);
@@ -207,10 +337,45 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
         } else {
           const stabilized = stabilizerRef.current.update(subPt.x, subPt.y);
           const last = rawPointsRef.current[rawPointsRef.current.length - 1];
-          if (!last || Math.hypot(stabilized.x - last.x, stabilized.y - last.y) >= 1.2) {
+          if (!last || Math.hypot(stabilized.x - last.x, stabilized.y - last.y) >= 1.0) {
+            if (last) addedLength += Math.hypot(stabilized.x - last.x, stabilized.y - last.y);
             rawPointsRef.current.push(stabilized);
+
+            minX = Math.min(minX, stabilized.x);
+            minY = Math.min(minY, stabilized.y);
+            maxX = Math.max(maxX, stabilized.x);
+            maxY = Math.max(maxY, stabilized.y);
           }
         }
+      }
+
+      // Record MOVE sample to RingBuffer
+      const inBounds = checkInBounds(pt);
+      globalPointerRingBuffer.push("MOVE", {
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        isPrimary: e.isPrimary,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        frameX: pt.x,
+        frameY: pt.y,
+        inBounds,
+        pressure: e.pressure,
+        buttons: e.buttons,
+        coalescedCount,
+        capture: captureHeldRef.current ? "held" : "none",
+        strokeId: inFlightStroke?.id,
+      });
+
+      // Update in-flight stroke and live stats
+      const rawCount = rawPointsRef.current.length;
+      if (strokeStatsRef.current) {
+        strokeStatsRef.current.rawPointCount = rawCount;
+        strokeStatsRef.current.inFlightPointCount = rawCount;
+        strokeStatsRef.current.pathLength += addedLength;
+        strokeStatsRef.current.estimatedBytes = rawCount * 8 + 32;
+        strokeStatsRef.current.bbox = { minX, minY, maxX, maxY };
+        onDebugStatsChange?.({ ...strokeStatsRef.current });
       }
 
       setInFlightStroke((prev) => {
@@ -229,20 +394,38 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
       effectiveSize,
       frame.id,
       frame.strokes,
+      inFlightStroke?.id,
       toFrameCoords,
+      checkInBounds,
       onEraseStroke,
       onInFlightMove,
+      onDebugStatsChange,
     ]
   );
 
-  const handlePointerUp = useCallback(
-    (e: React.PointerEvent<SVGSVGElement>) => {
-      if (!interactive || !isDrawingRef.current) return;
-      e.stopPropagation();
+  const completeStroke = useCallback(
+    (reason: "UP" | "CANCEL" | "LOST_CAPTURE") => {
+      if (!isDrawingRef.current || finishingRef.current) return;
+      finishingRef.current = true;
+
+      const pointerId = activePointerIdRef.current;
       isDrawingRef.current = false;
 
-      if (activeTool !== "eraser" && inFlightStroke && rawPointsRef.current.length > 0) {
-        // Compress & simplify points before committing to storage/sync
+      // Log termination event
+      globalPointerRingBuffer.push(reason, {
+        pointerId: pointerId ?? undefined,
+        capture: "none",
+        strokeId: inFlightStroke?.id,
+        detail: `points: ${rawPointsRef.current.length}`,
+      });
+
+      if (
+        reason === "UP" &&
+        activeTool !== "eraser" &&
+        inFlightStroke &&
+        rawPointsRef.current.length > 0
+      ) {
+        // Compress & simplify points before committing
         const simplified =
           activeTool === "rect"
             ? rawPointsRef.current
@@ -252,15 +435,84 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
           ...inFlightStroke,
           pts: packPoints(simplified),
         };
+
+        if (strokeStatsRef.current) {
+          strokeStatsRef.current.simplifiedPointCount = simplified.length;
+          strokeStatsRef.current.estimatedBytes = simplified.length * 8 + 32;
+          onDebugStatsChange?.({ ...strokeStatsRef.current });
+        }
+
         onCommitStroke?.(frame.id, finalStroke);
       }
 
+      // Release capture safely
+      if (pointerId !== null) {
+        releaseCaptureSafely(svgRef.current, pointerId);
+      }
+
+      activePointerIdRef.current = null;
       rawPointsRef.current = [];
       setInFlightStroke(null);
+      strokeStatsRef.current = null;
+      onDebugStatsChange?.(null);
       onInFlightMove?.(frame.id, cursorPos?.x ?? 0, cursorPos?.y ?? 0, null);
+      finishingRef.current = false;
     },
-    [interactive, activeTool, inFlightStroke, frame.id, cursorPos, onCommitStroke, onInFlightMove]
+    [
+      activeTool,
+      inFlightStroke,
+      frame.id,
+      cursorPos,
+      releaseCaptureSafely,
+      onCommitStroke,
+      onInFlightMove,
+      onDebugStatsChange,
+    ]
   );
+
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) {
+        return;
+      }
+      e.stopPropagation();
+      completeStroke("UP");
+    },
+    [completeStroke]
+  );
+
+  const handlePointerCancel = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) {
+        return;
+      }
+      e.stopPropagation();
+      // On mobile gesture collision or system cancel, commit what was drawn or terminate cleanly
+      completeStroke("CANCEL");
+    },
+    [completeStroke]
+  );
+
+  const handleLostPointerCapture = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      if (activePointerIdRef.current !== null && e.pointerId === activePointerIdRef.current) {
+        completeStroke("LOST_CAPTURE");
+      }
+    },
+    [completeStroke]
+  );
+
+  // Global window blur listener to prevent stuck drawing state if user switches apps/tabs
+  useEffect(() => {
+    const handleBlur = () => {
+      if (isDrawingRef.current) {
+        globalPointerRingBuffer.push("BLUR", { detail: "window blur / tab switch" });
+        completeStroke("CANCEL");
+      }
+    };
+    window.addEventListener("blur", handleBlur);
+    return () => window.removeEventListener("blur", handleBlur);
+  }, [completeStroke]);
 
   return (
     <svg
@@ -270,18 +522,25 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
       onPointerDown={interactive ? handlePointerDown : undefined}
       onPointerMove={interactive ? handlePointerMove : undefined}
       onPointerUp={interactive ? handlePointerUp : undefined}
-      onPointerCancel={interactive ? handlePointerUp : undefined}
+      onPointerCancel={interactive ? handlePointerCancel : undefined}
+      onLostPointerCapture={interactive ? handleLostPointerCapture : undefined}
       onPointerLeave={
         interactive
           ? (e) => {
-              setCursorPos(null);
-              handlePointerUp(e);
+              // Crucial fix: DO NOT terminate the stroke on pointerleave!
+              // Active pointer capture allows continuous drawing outside SVG boundaries.
+              if (activePointerIdRef.current === null || e.pointerId !== activePointerIdRef.current) {
+                setCursorPos(null);
+              }
             }
           : undefined
       }
       style={{
         width: "100%",
         height: "100%",
+        touchAction: "none",
+        userSelect: "none",
+        WebkitUserSelect: "none",
         cursor: interactive
           ? activeTool === "eraser"
             ? "cell"
@@ -385,6 +644,18 @@ export const StoryboardFrame: React.FC<StoryboardFrameProps> = ({
           strokeWidth={1.2}
           opacity={0.65}
           className="pointer-events-none"
+        />
+      )}
+
+      {/* High-Visibility Debug Overlay */}
+      {debugMode && (
+        <DrawingDebugOverlay
+          width={frame.width}
+          height={frame.height}
+          rawPoints={rawPointsRef.current}
+          cursorPos={cursorPos}
+          stats={strokeStatsRef.current}
+          isDrawing={isDrawingRef.current}
         />
       )}
     </svg>
