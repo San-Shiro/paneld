@@ -5,8 +5,14 @@ import { resolve } from "path";
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: true,
     port: 5175,
-    allowedHosts: true,
+    allowedHosts: [
+      "board.sanshiro.dpdns.org",
+      ".sanshiro.dpdns.org",
+      "localhost",
+      "127.0.0.1",
+    ],
   },
   build: {
     lib: {
